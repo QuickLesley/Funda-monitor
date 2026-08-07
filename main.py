@@ -1,8 +1,10 @@
 import os
 import re
 import json
+import time
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 
 # Matches Funda listing detail URLs, e.g.
 # /detail/koop/geldrop/huis-herdersveld-25/44556468/
@@ -16,6 +18,11 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SEEN_FILE = "seen_listings.json"
 
+# Funda shows around 15 results per page. Since we force newest-first sort
+# order below, we only need the first few pages to catch anything new
+# between runs -- no need to page through the entire search every time.
+MAX_PAGES = 5
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -26,28 +33,49 @@ HEADERS = {
 }
 
 
-def fetch_listings():
-    """Fetch the Funda search results page and parse listing cards.
+def force_newest_first(base_url):
+    """Force the search to be sorted by date, newest first.
 
-    Tries curl_cffi first (impersonates a real Chrome browser at the network
-    level, which helps get past basic/medium anti-bot checks). Falls back to
-    plain requests if curl_cffi isn't available for some reason.
+    This matters because we only fetch the first few pages (see MAX_PAGES) --
+    if the results weren't sorted newest-first, that shortcut could miss
+    listings sitting further back in the results.
     """
+    parsed = urlparse(base_url)
+    query = parse_qs(parsed.query)
+    query["sort"] = ['"date_down"']
+    new_query = urlencode(query, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+
+def build_page_url(base_url, page):
+    """Return base_url with the search_result (page number) query param set."""
+    parsed = urlparse(base_url)
+    query = parse_qs(parsed.query)
+    query["search_result"] = [str(page)]
+    new_query = urlencode(query, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+
+def fetch_page_html(url):
+    """Fetch one page's HTML. Returns None on failure."""
     try:
         from curl_cffi import requests as curl_requests
         response = curl_requests.get(
-            FUNDA_URL, headers=HEADERS, impersonate="chrome124", timeout=30
+            url, headers=HEADERS, impersonate="chrome124", timeout=30
         )
     except ImportError:
-        response = requests.get(FUNDA_URL, headers=HEADERS, timeout=30)
+        response = requests.get(url, headers=HEADERS, timeout=30)
 
     if response.status_code != 200:
-        print(f"Warning: got status code {response.status_code} from Funda")
-        return []
+        print(f"Warning: got status code {response.status_code} for {url}")
+        return None
 
-    print(f"Received {len(response.text)} characters of HTML from Funda")
+    return response.text
 
-    soup = BeautifulSoup(response.text, "html.parser")
+
+def parse_listings(html):
+    """Parse listing cards out of one search-results page's HTML."""
+    soup = BeautifulSoup(html, "html.parser")
     listings = {}
 
     # Walk every link on the page and keep the ones that point at a listing
@@ -90,7 +118,36 @@ def fetch_listings():
             "url": full_url,
         }
 
-    return list(listings.values())
+    return listings
+
+
+def fetch_listings():
+    """Fetch the first few pages (newest-first) of the Funda search."""
+    all_listings = {}
+    sorted_url = force_newest_first(FUNDA_URL)
+
+    for page in range(1, MAX_PAGES + 1):
+        page_url = build_page_url(sorted_url, page)
+        html = fetch_page_html(page_url)
+        if html is None:
+            break
+
+        page_listings = parse_listings(html)
+        new_ids = [lid for lid in page_listings if lid not in all_listings]
+
+        print(f"Page {page}: found {len(page_listings)} listings ({len(new_ids)} new)")
+
+        if not page_listings or not new_ids:
+            # Empty page, or a page that repeats what we already have --
+            # either way we've reached the end of the results.
+            break
+
+        all_listings.update(page_listings)
+
+        if page < MAX_PAGES:
+            time.sleep(1)  # be a little polite between requests
+
+    return list(all_listings.values())
 
 
 def load_seen():
