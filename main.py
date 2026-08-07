@@ -74,16 +74,22 @@ def fetch_page_html(url):
 
 
 def parse_listings(html):
-    """Parse listing cards out of one search-results page's HTML."""
+    """Parse listing cards out of one search-results page's HTML.
+
+    Each listing on the page typically has two links pointing at the same
+    detail URL: one wrapping the photo (which can include badge text like
+    "Sold" or promo captions mixed into it), and one wrapping the address
+    as a heading. We deliberately only read the heading link, since that's
+    the one that reliably contains just the street address.
+    """
     soup = BeautifulSoup(html, "html.parser")
     listings = {}
 
-    # Walk every link on the page and keep the ones that point at a listing
-    # detail page. Each listing on the search results page usually appears
-    # twice (once wrapping the photo, once wrapping the address heading) --
-    # we keep the one that actually has visible text, since that's the
-    # address link, and skip the empty image link.
-    for a in soup.find_all("a", href=True):
+    for heading in soup.find_all(["h1", "h2", "h3"]):
+        a = heading.find("a", href=True)
+        if not a:
+            continue
+
         href = a["href"]
         match = DETAIL_URL_RE.search(href)
         if not match:
@@ -91,9 +97,7 @@ def parse_listings(html):
 
         listing_id = match.group(2)
         address = a.get_text(strip=True)
-        if not address:
-            continue
-        if listing_id in listings:
+        if not address or listing_id in listings:
             continue
 
         full_url = href if href.startswith("http") else f"https://www.funda.nl{href}"
