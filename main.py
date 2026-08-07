@@ -1,7 +1,15 @@
 import os
+import re
 import json
 import requests
 from bs4 import BeautifulSoup
+
+# Matches Funda listing detail URLs, e.g.
+# /detail/koop/geldrop/huis-herdersveld-25/44556468/
+# This pattern is far more stable over time than CSS classes or
+# data-test-id attributes, which Funda changes periodically.
+DETAIL_URL_RE = re.compile(r"/detail/(koop|huur)/[^\"'>]+?/(\d+)/?")
+PRICE_RE = re.compile(r"€\s?[\d.,]+")
 
 FUNDA_URL = os.environ["FUNDA_URL"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -37,41 +45,52 @@ def fetch_listings():
         print(f"Warning: got status code {response.status_code} from Funda")
         return []
 
+    print(f"Received {len(response.text)} characters of HTML from Funda")
+
     soup = BeautifulSoup(response.text, "html.parser")
-    listings = []
+    listings = {}
 
-    # NOTE: Funda occasionally changes its page structure. If this stops
-    # finding listings, these selectors are the first thing to check.
-    cards = soup.select("[data-test-id='search-result-item']")
-
-    for card in cards:
-        link_tag = card.select_one("a[data-test-id='object-image-link']") or card.find(
-            "a", href=True
-        )
-        if not link_tag:
+    # Walk every link on the page and keep the ones that point at a listing
+    # detail page. Each listing on the search results page usually appears
+    # twice (once wrapping the photo, once wrapping the address heading) --
+    # we keep the one that actually has visible text, since that's the
+    # address link, and skip the empty image link.
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        match = DETAIL_URL_RE.search(href)
+        if not match:
             continue
 
-        href = link_tag["href"]
-        listing_id = href.rstrip("/").split("/")[-1]
-
-        address_tag = card.select_one("[data-test-id='street-name-house-number']")
-        address = address_tag.get_text(strip=True) if address_tag else "Unknown address"
-
-        price_tag = card.select_one("[data-test-id='price-sale']")
-        price = price_tag.get_text(strip=True) if price_tag else "Unknown price"
+        listing_id = match.group(2)
+        address = a.get_text(strip=True)
+        if not address:
+            continue
+        if listing_id in listings:
+            continue
 
         full_url = href if href.startswith("http") else f"https://www.funda.nl{href}"
 
-        listings.append(
-            {
-                "id": listing_id,
-                "address": address,
-                "price": price,
-                "url": full_url,
-            }
-        )
+        # Look for a nearby price (marked with a euro sign) by walking up
+        # a few parent elements from the address link.
+        price = "Price unknown"
+        container = a
+        for _ in range(4):
+            container = container.parent
+            if container is None:
+                break
+            price_match = PRICE_RE.search(container.get_text(" ", strip=True))
+            if price_match:
+                price = price_match.group(0)
+                break
 
-    return listings
+        listings[listing_id] = {
+            "id": listing_id,
+            "address": address,
+            "price": price,
+            "url": full_url,
+        }
+
+    return list(listings.values())
 
 
 def load_seen():
